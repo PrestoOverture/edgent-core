@@ -33,7 +33,7 @@ pip install -e .[dev]
 
 ## 关键约束
 
-- **零盲人业务**：任何涉及"读字 / 导航 / 紧急求助 / 菜单 / 招牌"的概念都不能出现在本 repo
+- **零盲人业务**：不能出现盲人特定 taxonomy、避障策略、scene-typed 读字子类（如菜单 / 招牌 / 药品标签）、导航 / 紧急求助等业务 payload；允许保留通用 `describe_scene` / `read_text` 这类基础能力
 - 所有对外 API 保持可开源状态（license headers、依赖审查）
 - 接口变更必须先更新 workspace `docs/interfaces.md` 再改本 repo
 - `ClassifierRouter` 低延迟单次 LLM 调用是硬约束（V1 依赖，不能退化成多 hop）
