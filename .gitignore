@@ -1,11 +1,36 @@
+# Private project docs
+docs/
+
+# Local environments
 .venv/
+venv/
+env/
+.env
+.env.*
+!.env.example
+
+# Python cache / test cache
 __pycache__/
-*.pyc
+*.py[cod]
+*$py.class
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/
-.env
-.DS_Store
+.coverage
+coverage.xml
+htmlcov/
+
+# Packaging / build outputs
 *.egg-info/
 dist/
 build/
+wheelhouse/
+
+# Runtime outputs
+traces/
+*.jsonl
+
+# IDE / OS noise
+.DS_Store
+.idea/
+.vscode/
