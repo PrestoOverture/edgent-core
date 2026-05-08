@@ -1,6 +1,6 @@
 """Public exports for the pre-release runtime kernel."""
 
-from .backend import ClassifierOutput, LLMBackend, StubLLMBackend, StubVLMBackend, VLMBackend
+from .backend import ClassifierOutput, LLMBackend, OpenAIVLMBackend, StubLLMBackend, StubVLMBackend, VLMBackend
 from .errors import BackendError, CoreRuntimeError, RouteError, ToolError, ValidationError
 from .eval import (
     EvalCaseResult,
@@ -49,6 +49,7 @@ __all__ = [
     "IntentNode",
     "JsonlTraceLogger",
     "LLMBackend",
+    "OpenAIVLMBackend", 
     "Orchestrator",
     "PayloadValidator",
     "ReadTextTool",

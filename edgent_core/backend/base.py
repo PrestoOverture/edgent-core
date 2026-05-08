@@ -64,11 +64,14 @@ class StubLLMBackend:
             if choice.lower() in normalized:
                 return ClassifierOutput(choice=choice, confidence=0.95)
 
-            raw_hints = choice_hints.get(choice, [])
-            hints = raw_hints if isinstance(raw_hints, Sequence) else []
+            raw_hint = choice_hints.get(choice, "") 
+            hints = raw_hint if isinstance(raw_hint, Sequence) else "" 
             for hint in hints:
-                if isinstance(hint, str) and hint and hint.lower() in normalized:
-                    return ClassifierOutput(choice=choice, confidence=0.9)
+                if not isinstance(hint, str) or not hint:
+                    continue 
+                for word in hint.split():
+                    if word.lower() in normalized:
+                        return ClassifierOutput(choice=choice, confidence=0.9)
 
         if not choices:
             return ClassifierOutput(choice="", confidence=0.0)
