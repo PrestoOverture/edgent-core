@@ -5,6 +5,7 @@ import pytest
 from edgent_core import (
     ConfidenceHook,
     HookOutcome,
+    ImageInput,
     Orchestrator,
     RouteDecision,
     RuntimeInput,
@@ -96,6 +97,32 @@ class FailingTool(StaticTool):
         raise ToolError("tool failure")
 
 
+class CapturingTool:
+    def __init__(self, name: str) -> None:
+        self.name = name
+        self.last_args: dict | None = None
+        self.input_schema = {"type": "object", "additionalProperties": True}
+        self.output_schema = {
+            "type": "object",
+            "properties": {"text": {"type": "string"}},
+            "required": ["text"],
+            "additionalProperties": False,
+        }
+
+    def invoke(self, args: dict) -> dict:
+        self.last_args = args
+        return {"text": "captured"}
+
+
+class FakeToolArgBuilder:
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, RuntimeInput, RouteDecision]] = []
+
+    def build(self, tool_name: str, input: RuntimeInput, decision: RouteDecision) -> dict:
+        self.calls.append((tool_name, input, decision))
+        return {"text": "from builder"}
+
+
 def _make_input() -> RuntimeInput:
     return RuntimeInput(text="payload", image=None, audio=None, session_id="session")
 
@@ -124,6 +151,63 @@ def test_orchestrator_pass_path() -> None:
     assert logger.events == ["start", "route", "hook", "tool", "final", "end"]
     assert logger.hook_outcomes == [(None, None)]
     assert logger.final_decisions == [("alpha", 0.9)]
+
+
+def test_orchestrator_default_tool_arg_builder_preserves_existing_mappings() -> None:
+    image = ImageInput(path="images/example.jpg")
+    cases = [
+        ("describe_scene", {"image": image, "query": "payload"}),
+        ("read_text", {"image": image, "instruction": "payload"}),
+        ("navigate_request", {"image": image, "text": "payload"}),
+    ]
+
+    for tool_name, expected_args in cases:
+        registry = ToolRegistry()
+        tool = CapturingTool(tool_name)
+        registry.register(tool)
+        orchestrator = Orchestrator(
+            router=DecisionRouter(
+                RouteDecision(
+                    intent="alpha",
+                    confidence=0.9,
+                    secondary_intent=None,
+                    rationale="default args",
+                    routed_tool=tool_name,
+                )
+            ),
+            tool_registry=registry,
+        )
+
+        output = orchestrator.run(
+            RuntimeInput(text="payload", image=image, audio=None, session_id="session")
+        )
+
+        assert output.text == "captured"
+        assert tool.last_args == expected_args
+
+
+def test_orchestrator_uses_injected_tool_arg_builder() -> None:
+    registry = ToolRegistry()
+    registry.register(StaticTool("tool_primary", "pass output"))
+    decision = RouteDecision(
+        intent="alpha",
+        confidence=0.9,
+        secondary_intent="beta",
+        rationale="custom args",
+        routed_tool="tool_primary",
+    )
+    input = _make_input()
+    builder = FakeToolArgBuilder()
+    orchestrator = Orchestrator(
+        router=DecisionRouter(decision),
+        tool_registry=registry,
+        tool_arg_builder=builder,
+    )
+
+    output = orchestrator.run(input)
+
+    assert output.text == "pass output"
+    assert builder.calls == [("tool_primary", input, decision)]
 
 
 def test_orchestrator_clarify_path() -> None:

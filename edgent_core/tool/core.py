@@ -133,7 +133,7 @@ class DescribeSceneTool:
 
 @dataclass
 class ReadTextTool:
-    """Built-in OCR-like text extraction helper."""
+    """Built-in text extraction helper."""
 
     vlm_backend: VLMBackend
 

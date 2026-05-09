@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Protocol
 
 from .errors import ToolError
 from .router import ConfidenceHook, HookOutcome, RouteDecision, Router
@@ -33,6 +33,35 @@ class RuntimeOutput:
     route_decision: RouteDecision
 
 
+class ToolArgBuilder(Protocol):
+    """Build arguments for one tool invocation."""
+
+    def build(self, tool_name: str, input: RuntimeInput, decision: RouteDecision) -> dict:
+        """Map runtime state into one tool invocation payload."""
+
+
+class DefaultToolArgBuilder:
+    """Default runtime-to-tool argument mapping."""
+
+    def build(self, tool_name: str, input: RuntimeInput, decision: RouteDecision) -> dict:
+        """Map runtime input into one single tool invocation payload."""
+
+        del decision
+        args: dict[str, object] = {}
+        if input.image is not None:
+            args["image"] = input.image
+        if input.audio is not None:
+            args["audio"] = input.audio
+        if input.text is not None:
+            if tool_name == "describe_scene":
+                args["query"] = input.text
+            elif tool_name == "read_text":
+                args["instruction"] = input.text
+            else:
+                args["text"] = input.text
+        return args
+
+
 class Orchestrator:
     """Run one route, one optional hook, and one optional tool invocation."""
 
@@ -42,11 +71,13 @@ class Orchestrator:
         tool_registry: ToolRegistry,
         confidence_hook: ConfidenceHook | None = None,
         trace_logger: TraceLogger | None = None,
+        tool_arg_builder: ToolArgBuilder | None = None,
     ) -> None:
         self.router = router
         self.tool_registry = tool_registry
         self.confidence_hook = confidence_hook
         self.trace_logger = trace_logger
+        self.tool_arg_builder = tool_arg_builder or DefaultToolArgBuilder()
 
     def run(self, input: RuntimeInput) -> RuntimeOutput:
         """Execute the minimal Phase 1 runtime loop."""
@@ -90,7 +121,7 @@ class Orchestrator:
             self._finish(output)
             return output
 
-        args = self._build_tool_args(tool_name, input)
+        args = self.tool_arg_builder.build(tool_name, input, decision)
         try:
             tool_output = self.tool_registry.invoke(tool_name, args)
         except Exception as exc:
@@ -115,23 +146,6 @@ class Orchestrator:
             self.trace_logger.on_final_decision(decision.intent, decision.confidence)
         self._finish(output)
         return output
-
-    def _build_tool_args(self, tool_name: str, input: RuntimeInput) -> dict:
-        """Map runtime input into one single tool invocation payload."""
-
-        args: dict[str, object] = {}
-        if input.image is not None:
-            args["image"] = input.image
-        if input.audio is not None:
-            args["audio"] = input.audio
-        if input.text is not None:
-            if tool_name == "describe_scene":
-                args["query"] = input.text
-            elif tool_name == "read_text":
-                args["instruction"] = input.text
-            else:
-                args["text"] = input.text
-        return args
 
     def _finish(self, output: RuntimeOutput) -> None:
         if self.trace_logger is not None:
