@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Literal, Protocol
 
 from .router import RouteDecision
+from .types import CostCalculator, Usage
 
 if TYPE_CHECKING:
     from .orchestrator import RuntimeInput, RuntimeOutput
@@ -80,8 +81,15 @@ class TraceLogger(Protocol):
 class JsonlTraceLogger:
     """Write one JSON line per completed run."""
 
-    def __init__(self, path: str | Path | None = None) -> None:
+    def __init__(
+        self,
+        path: str | Path | None = None,
+        cost_calculator: CostCalculator | None = None,
+        backends: list[object] | None = None,
+    ) -> None:
         self._configured_path = Path(path) if path is not None else None
+        self._cost_calculator = cost_calculator
+        self._backends = backends or []
         self.last_record: TraceRecord | None = None
         self._reset()
 
@@ -89,19 +97,19 @@ class JsonlTraceLogger:
         """Initialize state for one run."""
 
         self._reset()
-        self._trace_id = str(uuid.uuid4())
-        self._session_id = input.session_id
-        self._timestamp = datetime.now(timezone.utc).isoformat()
-        self._text = input.text
-        self._image_ref = input.image.persistent_ref() if input.image is not None else None
-        self._audio_ref = input.audio.persistent_ref() if input.audio is not None else None
-        self._started_at = time.monotonic()
+        self._trace_id: str | None = str(uuid.uuid4())
+        self._session_id: str | None = input.session_id
+        self._timestamp: str | None = datetime.now(timezone.utc).isoformat()
+        self._text: str | None = input.text
+        self._image_ref: str | None = input.image.persistent_ref() if input.image is not None else None
+        self._audio_ref: str | None = input.audio.persistent_ref() if input.audio is not None else None
+        self._started_at: float | None = time.monotonic()
         self._target_path = self._resolve_path(input.session_id)
 
     def on_route(self, decision: RouteDecision) -> None:
         """Store the route decision for the active run."""
 
-        self._route_decision = decision
+        self._route_decision: RouteDecision | None = decision
 
     def on_tool_invoke(
         self,
@@ -153,6 +161,8 @@ class JsonlTraceLogger:
             final_intent = output.route_decision.intent
             final_confidence = output.route_decision.confidence
 
+        cost_usd = self._compute_cost()
+
         record = TraceRecord(
             trace_id=self._trace_id or str(uuid.uuid4()),
             session_id=self._session_id or "",
@@ -168,13 +178,31 @@ class JsonlTraceLogger:
             final_intent=final_intent,
             final_confidence=final_confidence,
             latency_ms=latency_ms,
-            cost_usd=None,
+            cost_usd=cost_usd,
         )
         self._target_path.parent.mkdir(parents=True, exist_ok=True)
         with self._target_path.open("a", encoding="utf-8") as handle:
             handle.write(json.dumps(asdict(record), ensure_ascii=True))
             handle.write("\n")
         self.last_record = record
+
+    def _compute_cost(self) -> float | None:
+        """Aggregate token usage from backends and compute cost."""
+
+        if self._cost_calculator is None:
+            return None
+        total_prompt = 0
+        total_completion = 0
+        for backend in self._backends:
+            usage = getattr(backend, "last_usage", None)
+            if isinstance(usage, Usage):
+                total_prompt += usage.prompt_tokens
+                total_completion += usage.completion_tokens
+        if total_prompt == 0 and total_completion == 0:
+            return 0.0
+        return self._cost_calculator.calculate(
+            Usage(prompt_tokens=total_prompt, completion_tokens=total_completion)
+        )
 
     def _resolve_path(self, session_id: str) -> Path:
         if self._configured_path is None:
@@ -184,20 +212,20 @@ class JsonlTraceLogger:
         return self._configured_path / f"{session_id}.jsonl"
 
     def _reset(self) -> None:
-        self._trace_id: str | None = None
-        self._session_id: str | None = None
-        self._timestamp: str | None = None
-        self._text: str | None = None
-        self._image_ref: str | None = None
-        self._audio_ref: str | None = None
-        self._route_decision: RouteDecision | None = None
-        self._hook_action: Literal["pass", "clarify", "fallback"] | None = None
-        self._fallback_tool: str | None = None
+        self._trace_id = None
+        self._session_id = None
+        self._timestamp = None
+        self._text = None
+        self._image_ref = None
+        self._audio_ref = None
+        self._route_decision = None
+        self._hook_action = None
+        self._fallback_tool = None
         self._tool_calls: list[ToolCallTrace] = []
         self._final_decision_recorded = False
-        self._final_intent: str | None = None
-        self._final_confidence: float | None = None
-        self._started_at: float | None = None
+        self._final_intent = None
+        self._final_confidence = None
+        self._started_at = None
         self._target_path = Path("traces") / "runtime.jsonl"
 
 

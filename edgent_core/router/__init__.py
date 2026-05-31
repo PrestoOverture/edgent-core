@@ -7,10 +7,12 @@ from .core import (
     FallbackTrigger,
     HookOutcome,
     IntentNode,
+    PreRouteHook,
     RouteDecision,
     Router,
     SupervisorRouter,
     TaxonomySchema,
+    VisualCueProvider,
 )
 
 __all__ = [
@@ -20,8 +22,10 @@ __all__ = [
     "FallbackTrigger",
     "HookOutcome",
     "IntentNode",
+    "PreRouteHook",
     "RouteDecision",
     "Router",
     "SupervisorRouter",
     "TaxonomySchema",
+    "VisualCueProvider",
 ]

@@ -27,19 +27,22 @@ from .router import (
     FallbackTrigger,
     HookOutcome,
     IntentNode,
+    PreRouteHook,
     RouteDecision,
     Router,
     SupervisorRouter,
     TaxonomySchema,
+    VisualCueProvider,
 )
 from .tool import DescribeSceneTool, ReadTextTool, Tool, ToolRegistry
 from .trace import JsonlTraceLogger, ToolCallTrace, TraceLogger, TraceRecord
-from .types import AudioInput, ImageInput
+from .types import AudioInput, CostCalculator, ImageInput, Usage, VisualCue
 
 __all__ = [
     "AudioInput",
     "BackendError",
     "ClassifierOutput",
+    "CostCalculator",
     "ClassifierRouter",
     "ConfidenceHook",
     "CoreRuntimeError",
@@ -59,9 +62,10 @@ __all__ = [
     "JsonlTraceLogger",
     "LLMBackend",
     "OpenAILLMBackend",
-    "OpenAIVLMBackend", 
+    "OpenAIVLMBackend",
     "Orchestrator",
     "PayloadValidator",
+    "PreRouteHook",
     "ReadTextTool",
     "RouteDecision",
     "RouteError",
@@ -79,6 +83,9 @@ __all__ = [
     "ToolRegistry",
     "TraceLogger",
     "TraceRecord",
+    "Usage",
     "VLMBackend",
     "ValidationError",
+    "VisualCue",
+    "VisualCueProvider",
 ]

@@ -2,10 +2,11 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-from typing import Mapping, Protocol, Sequence
+from typing import Protocol
 
-from ..types import ImageInput
+from ..types import ImageInput, Usage
 
 
 @dataclass(frozen=True)
@@ -14,6 +15,7 @@ class ClassifierOutput:
 
     choice: str
     confidence: float
+    secondary_intent: str | None = None
 
 
 class VLMBackend(Protocol):
@@ -46,6 +48,7 @@ class StubLLMBackend:
     """Deterministic classifier and generator for local tests."""
 
     name = "stub-llm"
+    last_usage: Usage = Usage()
 
     def classify(
         self,
@@ -64,11 +67,11 @@ class StubLLMBackend:
             if choice.lower() in normalized:
                 return ClassifierOutput(choice=choice, confidence=0.95)
 
-            raw_hint = choice_hints.get(choice, "") 
-            hints = raw_hint if isinstance(raw_hint, Sequence) else "" 
+            raw_hint = choice_hints.get(choice, "")
+            hints = raw_hint if isinstance(raw_hint, Sequence) else ""
             for hint in hints:
                 if not isinstance(hint, str) or not hint:
-                    continue 
+                    continue
                 for word in hint.split():
                     if word.lower() in normalized:
                         return ClassifierOutput(choice=choice, confidence=0.9)
@@ -87,6 +90,7 @@ class StubVLMBackend:
     """Deterministic image-to-text backend for local tests."""
 
     name = "stub-vlm"
+    last_usage: Usage = Usage()
 
     def generate(self, image: ImageInput, query: str, **kwargs: object) -> str:
         """Return a predictable text response without external calls."""

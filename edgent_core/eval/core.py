@@ -106,42 +106,58 @@ class EvalHarness:
                 tool_registry=orchestrator.tool_registry,
                 confidence_hook=orchestrator.confidence_hook,
                 trace_logger=logger,
+                tool_arg_builder=orchestrator.tool_arg_builder,
+                backends=orchestrator.backends,
             )
 
         try:
             case_results: list[EvalCaseResult] = []
             for entry in dataset.entries:
-                runtime_input = RuntimeInput(
-                    text=entry.text,
-                    image=ImageInput(path=entry.image_ref) if entry.image_ref else None,
-                    audio=AudioInput(path=entry.audio_ref) if entry.audio_ref else None,
-                    session_id=f"eval-{entry.case_id}",
-                )
-                output = run_orchestrator.run(runtime_input)
-                trace_record = self._require_trace_record(run_orchestrator)
-                self._last_trace_records.append(trace_record)
-
-                schema_validation_passed: bool | None = None
-                if entry.expected_request_intent is not None and self.payload_validator is not None:
-                    schema_validation_passed = self.payload_validator.validate(entry, output)
-
-                matched_secondary = None
-                if entry.expected_secondary_intent is not None:
-                    matched_secondary = (
-                        output.route_decision.secondary_intent == entry.expected_secondary_intent
+                try:
+                    runtime_input = RuntimeInput(
+                        text=entry.text,
+                        image=ImageInput(path=entry.image_ref) if entry.image_ref else None,
+                        audio=AudioInput(path=entry.audio_ref) if entry.audio_ref else None,
+                        session_id=f"eval-{entry.case_id}",
                     )
+                    output = run_orchestrator.run(runtime_input)
+                    trace_record = self._require_trace_record(run_orchestrator)
+                    self._last_trace_records.append(trace_record)
 
-                case_results.append(
-                    EvalCaseResult(
-                        case_id=entry.case_id,
-                        trace_id=trace_record.trace_id,
-                        matched_gold_primary_intent=(
-                            output.route_decision.intent == entry.expected_primary_intent
-                        ),
-                        matched_gold_secondary_intent=matched_secondary,
-                        schema_validation_passed=schema_validation_passed,
+                    schema_validation_passed: bool | None = None
+                    if entry.expected_request_intent is not None and self.payload_validator is not None:
+                        schema_validation_passed = self.payload_validator.validate(entry, output)
+
+                    matched_secondary = None
+                    if entry.expected_secondary_intent is not None:
+                        matched_secondary = (
+                            output.route_decision.secondary_intent == entry.expected_secondary_intent
+                        )
+
+                    case_results.append(
+                        EvalCaseResult(
+                            case_id=entry.case_id,
+                            trace_id=trace_record.trace_id,
+                            matched_gold_primary_intent=(
+                                output.route_decision.intent == entry.expected_primary_intent
+                            ),
+                            matched_gold_secondary_intent=matched_secondary,
+                            schema_validation_passed=schema_validation_passed,
+                        )
                     )
-                )
+                except Exception as exc:
+                    # Log failure but continue with remaining cases
+                    import sys
+                    print(f"  WARN: case {entry.case_id} failed: {exc}", file=sys.stderr)
+                    case_results.append(
+                        EvalCaseResult(
+                            case_id=entry.case_id,
+                            trace_id="error",
+                            matched_gold_primary_intent=False,
+                            matched_gold_secondary_intent=None,
+                            schema_validation_passed=None,
+                        )
+                    )
             return EvalRunResult(case_results=case_results)
         finally:
             if local_temp_dir is not None:

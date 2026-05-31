@@ -3,18 +3,20 @@
 from __future__ import annotations
 
 import json
+import math
 from collections.abc import Mapping, Sequence
 
 from openai import OpenAI
 
 from ..errors import BackendError
+from ..types import Usage
 from .base import ClassifierOutput
-
 
 _CLASSIFIER_SYSTEM_PROMPT = """You are a closed-set routing classifier.
 Pick exactly one id from the supplied choices. Do not invent ids.
+If secondary_choices are provided and the selected intent has secondary options, pick the best matching secondary_choice id. Otherwise set secondary_intent to null.
 Return only JSON with this shape:
-{"intent":"<one choice id>","confidence":0.0,"secondary_intent":null,"rationale":"short reason"}
+{"intent":"<one choice id>","confidence":0.0,"secondary_intent":null or "<secondary id>","rationale":"short reason"}
 The confidence must be a number between 0.0 and 1.0."""
 
 
@@ -28,13 +30,17 @@ class OpenAILLMBackend:
         base_url: str,
         model: str,
         name: str | None = None,
-        max_tokens: int = 256,
+        max_tokens: int = 128,
         client: object | None = None,
+        enable_logprobs: bool = False,
     ) -> None:
         self.name = name or model
         self.model = model
         self.max_tokens = max_tokens
         self.last_rationale: str | None = None
+        self.last_usage: Usage = Usage()
+        self.last_calibrated_confidence: float | None = None
+        self._enable_logprobs = enable_logprobs
         self._client = client or OpenAI(api_key=api_key, base_url=base_url)
 
     def classify(
@@ -52,12 +58,33 @@ class OpenAILLMBackend:
             instruction=instruction,
             choices=choices,
             choice_hints=kwargs.get("choice_hints"),
+            secondary_choices=kwargs.get("secondary_choices"),
         )
-        messages = [
+        messages: list[dict[str, object]] = [
             {"role": "system", "content": _CLASSIFIER_SYSTEM_PROMPT},
             {"role": "user", "content": user_prompt},
         ]
 
+        # Try with logprobs first for calibrated confidence (if enabled)
+        self.last_calibrated_confidence = None
+        if self._enable_logprobs:
+            try:
+                content, logprobs = self._chat_with_logprobs(messages, response_format={"type": "json_object"})
+                result = self._parse_classifier_output(content, choices)
+                self._compute_calibrated_confidence(result.choice, logprobs)
+                return result
+            except Exception:
+                pass
+
+            try:
+                content, logprobs = self._chat_with_logprobs(messages)
+                result = self._parse_classifier_output(content, choices)
+                self._compute_calibrated_confidence(result.choice, logprobs)
+                return result
+            except Exception:
+                pass
+
+        # Standard path (no logprobs)
         try:
             content = self._chat(messages, response_format={"type": "json_object"})
             return self._parse_classifier_output(content, choices)
@@ -87,8 +114,99 @@ class OpenAILLMBackend:
         }
         if response_format is not None:
             kwargs["response_format"] = response_format
-        response = self._client.chat.completions.create(**kwargs)  # type: ignore[attr-defined]
+        response = self._client.chat.completions.create(**kwargs)  # type: ignore[attr-defined]  # duck-typed client for test injection
+        usage = getattr(response, "usage", None)
+        if usage is not None:
+            self.last_usage = Usage(
+                prompt_tokens=getattr(usage, "prompt_tokens", 0),
+                completion_tokens=getattr(usage, "completion_tokens", 0),
+            )
         return response.choices[0].message.content or ""
+
+    def _chat_with_logprobs(
+        self,
+        messages: list[dict[str, object]],
+        response_format: dict[str, str] | None = None,
+    ) -> tuple[str, list[object]]:
+        """Like _chat but also returns token logprobs. Raises if logprobs unavailable."""
+
+        kwargs: dict[str, object] = {
+            "model": self.model,
+            "messages": messages,
+            "max_tokens": self.max_tokens,
+            "logprobs": True,
+            "top_logprobs": 5,
+        }
+        if response_format is not None:
+            kwargs["response_format"] = response_format
+        response = self._client.chat.completions.create(**kwargs)  # type: ignore[attr-defined]  # duck-typed client for test injection
+        usage = getattr(response, "usage", None)
+        if usage is not None:
+            self.last_usage = Usage(
+                prompt_tokens=getattr(usage, "prompt_tokens", 0),
+                completion_tokens=getattr(usage, "completion_tokens", 0),
+            )
+        choice = response.choices[0]
+        logprobs_obj = getattr(choice, "logprobs", None)
+        if logprobs_obj is None:
+            raise BackendError("Logprobs not available in response.")
+        content = choice.message.content or ""
+        token_logprobs = getattr(logprobs_obj, "content", None)
+        if not token_logprobs:
+            raise BackendError("Logprobs content is empty.")
+        return content, token_logprobs
+
+    def _compute_calibrated_confidence(self, choice: str, token_logprobs: list[object]) -> None:
+        """Compute calibrated confidence from token logprobs for the chosen intent.
+
+        Finds the tokens that spell the chosen intent in the output and computes
+        the average probability of those tokens.
+        """
+
+        # Collect all tokens and their logprobs
+        tokens: list[str] = []
+        logprobs: list[float] = []
+        for tl in token_logprobs:
+            token = getattr(tl, "token", "")
+            lp = getattr(tl, "logprob", -999.0)
+            tokens.append(token)
+            logprobs.append(lp)
+
+        # Find the substring of all tokens concatenated
+        full_text = "".join(tokens)
+
+        # Find where the choice string appears in the token stream
+        choice_lower = choice.lower()
+        char_pos = full_text.lower().find(choice_lower)
+        if char_pos < 0:
+            # Choice not found in output tokens; can't calibrate
+            return
+
+        # Map character positions back to token indices
+        token_start = None
+        token_end = None
+        cum_pos = 0
+        for i, token in enumerate(tokens):
+            token_end_pos = cum_pos + len(token)
+            if token_start is None and char_pos < token_end_pos:
+                token_start = i
+            if token_start is not None and char_pos + len(choice_lower) <= token_end_pos:
+                token_end = i + 1
+                break
+            cum_pos = token_end_pos
+
+        if token_start is None or token_end is None:
+            return
+
+        # Average logprob of the intent tokens
+        intent_logprobs = logprobs[token_start:token_end]
+        if not intent_logprobs:
+            return
+        avg_logprob = sum(intent_logprobs) / len(intent_logprobs)
+        # Clamp to avoid math domain issues
+        avg_logprob = max(avg_logprob, -20.0)
+        calibrated = math.exp(avg_logprob)
+        self.last_calibrated_confidence = max(0.0, min(calibrated, 1.0))
 
     def _parse_classifier_output(self, content: str, choices: list[str]) -> ClassifierOutput:
         try:
@@ -98,8 +216,11 @@ class OpenAILLMBackend:
         if not isinstance(payload, Mapping):
             raise BackendError("LLM classifier output must be a JSON object.")
 
-        choice = payload.get("intent")
-        if not isinstance(choice, str) or choice not in choices:
+        raw_choice = payload.get("intent")
+        if not isinstance(raw_choice, str):
+            raise BackendError("LLM returned an unknown classifier choice.")
+        choice = raw_choice.strip().lower()
+        if choice not in choices:
             raise BackendError("LLM returned an unknown classifier choice.")
 
         raw_confidence = payload.get("confidence")
@@ -109,7 +230,14 @@ class OpenAILLMBackend:
 
         rationale = payload.get("rationale")
         self.last_rationale = rationale if isinstance(rationale, str) else None
-        return ClassifierOutput(choice=choice, confidence=confidence)
+
+        secondary_intent_raw = payload.get("secondary_intent")
+        if isinstance(secondary_intent_raw, str):
+            secondary_intent = secondary_intent_raw.strip().lower() or None
+        else:
+            secondary_intent = None
+
+        return ClassifierOutput(choice=choice, confidence=confidence, secondary_intent=secondary_intent)
 
 
 def _build_classifier_user_prompt(
@@ -117,6 +245,7 @@ def _build_classifier_user_prompt(
     instruction: str,
     choices: list[str],
     choice_hints: object,
+    secondary_choices: object = None,
 ) -> str:
     hints: dict[str, list[str]] = {}
     if isinstance(choice_hints, Mapping):
@@ -131,11 +260,11 @@ def _build_classifier_user_prompt(
     else:
         hints = {choice: [] for choice in choices}
 
-    return json.dumps(
-        {
-            "instruction": instruction,
-            "choices": choices,
-            "choice_hints": hints,
-        },
-        ensure_ascii=False,
-    )
+    payload: dict[str, object] = {
+        "instruction": instruction,
+        "choices": choices,
+        "choice_hints": hints,
+    }
+    if isinstance(secondary_choices, Mapping) and secondary_choices:
+        payload["secondary_choices"] = secondary_choices
+    return json.dumps(payload, ensure_ascii=False)

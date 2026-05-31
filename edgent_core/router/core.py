@@ -9,9 +9,24 @@ from typing import TYPE_CHECKING, Literal, Protocol
 
 from ..backend import LLMBackend
 from ..errors import RouteError, ValidationError
+from ..types import VisualCue
 
 if TYPE_CHECKING:
     from ..orchestrator import RuntimeInput
+
+
+class VisualCueProvider(Protocol):
+    """Optional provider that extracts visual hints from an image."""
+
+    def get_cue(self, input: RuntimeInput) -> VisualCue | None:
+        """Return a visual cue for the given input, or None if unavailable."""
+
+
+class PreRouteHook(Protocol):
+    """Hook executed before the Router calls the LLM. Can short-circuit routing."""
+
+    def pre_route(self, input: RuntimeInput) -> RouteDecision | None:
+        """Return a RouteDecision to skip the LLM, or None to continue normal routing."""
 
 
 _SNAKE_CASE = re.compile(r"^[a-z][a-z0-9_]*$")
@@ -135,13 +150,23 @@ class ClassifierRouter:
         taxonomy: TaxonomySchema,
         llm_backend: LLMBackend,
         hook: ConfidenceHook | None = None,
+        visual_cue_provider: VisualCueProvider | None = None,
+        pre_route_hook: PreRouteHook | None = None,
     ) -> None:
         self.taxonomy = taxonomy
         self.llm_backend = llm_backend
         self.hook = hook
+        self.visual_cue_provider = visual_cue_provider
+        self.pre_route_hook = pre_route_hook
 
     def route(self, input: RuntimeInput) -> RouteDecision:
         """Route one input into the configured taxonomy."""
+
+        # Pre-route hook: can short-circuit before LLM call
+        if self.pre_route_hook is not None:
+            pre_decision = self.pre_route_hook.pre_route(input)
+            if pre_decision is not None:
+                return pre_decision
 
         primary_nodes = self.taxonomy.primary_nodes
         if not primary_nodes:
@@ -153,22 +178,60 @@ class ClassifierRouter:
             for node in primary_nodes
         }
         instruction = input.text or ""
+
+        # Inject visual cue if available
+        if self.visual_cue_provider is not None:
+            cue = self.visual_cue_provider.get_cue(input)
+            if cue is not None:
+                cue_str = _format_visual_cue(cue)
+                instruction = f"{cue_str}\n{instruction}" if instruction else cue_str
+
+        # Build secondary choices map for the LLM
+        secondary_choices: dict[str, list[str]] = {}
+        for parent_id, nodes in self.taxonomy.secondary_nodes_by_parent.items():
+            secondary_choices[parent_id] = [node.id for node in nodes]
+
         output = self.llm_backend.classify(
             instruction=instruction,
             choices=choices,
             choice_hints=choice_hints,
+            secondary_choices=secondary_choices,
         )
         if output.choice not in choices:
             raise RouteError(f"Backend returned unknown choice: {output.choice}")
 
         primary_node = self.taxonomy.primary_by_id(output.choice)
+
+        # Resolve secondary intent: prefer LLM output, fallback to substring match
+        secondary = self._resolve_secondary(
+            primary_node.id, output.secondary_intent, input.text or ""
+        )
+
         return RouteDecision(
             intent=primary_node.id,
             confidence=output.confidence,
-            secondary_intent=self._match_secondary(primary_node.id, instruction),
+            secondary_intent=secondary,
             rationale=f"classified via {self.llm_backend.name}",
             routed_tool=primary_node.routed_tool,
         )
+
+    def _resolve_secondary(
+        self, primary_id: str, llm_secondary: str | None, instruction: str
+    ) -> str | None:
+        """Resolve secondary intent: validate LLM output, fallback to substring match."""
+
+        valid_secondaries = {
+            node.id for node in self.taxonomy.secondary_nodes_by_parent.get(primary_id, [])
+        }
+        if not valid_secondaries:
+            return None
+
+        # Prefer LLM's secondary_intent if it's valid
+        if llm_secondary and llm_secondary in valid_secondaries:
+            return llm_secondary
+
+        # Fallback to substring match
+        return self._match_secondary(primary_id, instruction)
 
     def _match_secondary(self, primary_id: str, instruction: str) -> str | None:
         """Best-effort secondary match from the same input text."""
@@ -235,3 +298,12 @@ class SupervisorRouter:
 
         del input
         raise NotImplementedError("SupervisorRouter is not wired in Phase 1.")
+
+
+def _format_visual_cue(cue: VisualCue) -> str:
+    """Format a visual cue as a compact hint string for the LLM classifier."""
+
+    parts = [f"has_readable_text={'true' if cue.has_readable_text else 'false'}"]
+    if cue.text_surface_type:
+        parts.append(f"text_surface_type=\"{cue.text_surface_type}\"")
+    return "[visual_context: " + ", ".join(parts) + "]"

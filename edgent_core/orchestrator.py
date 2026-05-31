@@ -5,13 +5,12 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Protocol
 
-from .errors import ToolError
 from .router import ConfidenceHook, HookOutcome, RouteDecision, Router
 from .tool import ToolRegistry
 from .types import AudioInput, ImageInput
 
 if TYPE_CHECKING:
-    from .trace import JsonlTraceLogger, TraceLogger
+    from .trace import TraceLogger
 
 
 @dataclass
@@ -72,12 +71,14 @@ class Orchestrator:
         confidence_hook: ConfidenceHook | None = None,
         trace_logger: TraceLogger | None = None,
         tool_arg_builder: ToolArgBuilder | None = None,
+        backends: list[object] | None = None,
     ) -> None:
         self.router = router
         self.tool_registry = tool_registry
         self.confidence_hook = confidence_hook
         self.trace_logger = trace_logger
         self.tool_arg_builder = tool_arg_builder or DefaultToolArgBuilder()
+        self.backends = backends or []
 
     def run(self, input: RuntimeInput) -> RuntimeOutput:
         """Execute the minimal Phase 1 runtime loop."""
