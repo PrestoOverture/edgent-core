@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import httpx
 import pytest
 
 from edgent_core import BackendError, OpenAILLMBackend
@@ -209,3 +210,47 @@ def test_openai_llm_backend_normalizes_choice_whitespace_and_case() -> None:
 
     assert output.choice == "read_text"
     assert output.confidence == 0.9
+
+
+def test_openai_llm_backend_wraps_timeout_as_backend_error() -> None:
+    """API timeout is wrapped in BackendError after retries exhausted."""
+    from openai import APITimeoutError
+
+    class _TimeoutCompletions:
+        def create(self, **kwargs):  # noqa: ANN003
+            raise APITimeoutError(request=httpx.Request("POST", "https://example.test"))
+
+    class _TimeoutChat:
+        def __init__(self) -> None:
+            self.completions = _TimeoutCompletions()
+
+    class _TimeoutClient:
+        def __init__(self) -> None:
+            self.chat = _TimeoutChat()
+
+    backend = OpenAILLMBackend(api_key="key", base_url="https://example.test/v1", model="model", client=_TimeoutClient())
+
+    with pytest.raises(BackendError, match="timed out"):
+        backend.classify(instruction="test", choices=["a"])
+
+
+def test_openai_llm_backend_wraps_connection_error_as_backend_error() -> None:
+    """API connection error is wrapped in BackendError after retries exhausted."""
+    from openai import APIConnectionError
+
+    class _ConnCompletions:
+        def create(self, **kwargs):  # noqa: ANN003
+            raise APIConnectionError(request=httpx.Request("POST", "https://example.test"))
+
+    class _ConnChat:
+        def __init__(self) -> None:
+            self.completions = _ConnCompletions()
+
+    class _ConnClient:
+        def __init__(self) -> None:
+            self.chat = _ConnChat()
+
+    backend = OpenAILLMBackend(api_key="key", base_url="https://example.test/v1", model="model", client=_ConnClient())
+
+    with pytest.raises(BackendError, match="connection failed"):
+        backend.classify(instruction="test", choices=["a"])

@@ -5,8 +5,9 @@ from __future__ import annotations
 import json
 import math
 from collections.abc import Mapping, Sequence
+from typing import Any
 
-from openai import OpenAI
+from openai import APIConnectionError, APITimeoutError, OpenAI
 
 from ..errors import BackendError
 from ..types import Usage
@@ -33,6 +34,8 @@ class OpenAILLMBackend:
         max_tokens: int = 128,
         client: object | None = None,
         enable_logprobs: bool = False,
+        request_timeout: float = 30.0,
+        max_retries: int = 2,
     ) -> None:
         self.name = name or model
         self.model = model
@@ -41,7 +44,9 @@ class OpenAILLMBackend:
         self.last_usage: Usage = Usage()
         self.last_calibrated_confidence: float | None = None
         self._enable_logprobs = enable_logprobs
-        self._client = client or OpenAI(api_key=api_key, base_url=base_url)
+        self._client = client or OpenAI(
+            api_key=api_key, base_url=base_url, timeout=request_timeout, max_retries=max_retries,
+        )
 
     def classify(
         self,
@@ -85,15 +90,29 @@ class OpenAILLMBackend:
                 pass
 
         # Standard path (no logprobs)
+        # Attempt 1: with JSON response_format
+        result_content: str | None = None
         try:
-            content = self._chat(messages, response_format={"type": "json_object"})
-            return self._parse_classifier_output(content, choices)
-        except Exception as first_error:
+            result_content = self._chat(messages, response_format={"type": "json_object"})
+        except BackendError:
+            raise  # timeout / connection — don't swallow
+        except Exception:
+            result_content = None
+
+        if result_content is not None:
             try:
-                content = self._chat(messages)
-                return self._parse_classifier_output(content, choices)
-            except Exception as second_error:
-                raise BackendError("LLM classification failed.") from second_error or first_error
+                return self._parse_classifier_output(result_content, choices)
+            except Exception:
+                pass  # parse failure — retry without json mode
+
+        # Attempt 2: without JSON response_format
+        try:
+            result_content = self._chat(messages)
+        except BackendError:
+            raise  # timeout / connection — don't swallow
+        except Exception as exc:
+            raise BackendError("LLM classification failed.") from exc
+        return self._parse_classifier_output(result_content, choices)
 
     def generate(self, instruction: str, **kwargs: object) -> str:
         """Generate free-form text from an instruction."""
@@ -101,6 +120,15 @@ class OpenAILLMBackend:
         del kwargs
         response = self._chat([{"role": "user", "content": instruction}])
         return response
+
+    def _call_api(self, **kwargs: object) -> Any:
+        """Call the chat completions API with timeout/retry error wrapping."""
+        try:
+            return self._client.chat.completions.create(**kwargs)  # type: ignore[attr-defined]  # duck-typed client for test injection
+        except APITimeoutError as exc:
+            raise BackendError(f"LLM request timed out: {exc}") from exc
+        except APIConnectionError as exc:
+            raise BackendError(f"LLM connection failed: {exc}") from exc
 
     def _chat(
         self,
@@ -114,7 +142,7 @@ class OpenAILLMBackend:
         }
         if response_format is not None:
             kwargs["response_format"] = response_format
-        response = self._client.chat.completions.create(**kwargs)  # type: ignore[attr-defined]  # duck-typed client for test injection
+        response = self._call_api(**kwargs)
         usage = getattr(response, "usage", None)
         if usage is not None:
             self.last_usage = Usage(
@@ -139,7 +167,7 @@ class OpenAILLMBackend:
         }
         if response_format is not None:
             kwargs["response_format"] = response_format
-        response = self._client.chat.completions.create(**kwargs)  # type: ignore[attr-defined]  # duck-typed client for test injection
+        response = self._call_api(**kwargs)
         usage = getattr(response, "usage", None)
         if usage is not None:
             self.last_usage = Usage(

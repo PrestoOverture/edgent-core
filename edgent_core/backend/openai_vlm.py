@@ -7,8 +7,9 @@ import io
 import mimetypes
 from pathlib import Path
 
-from openai import OpenAI
+from openai import APIConnectionError, APITimeoutError, OpenAI
 
+from ..errors import BackendError
 from ..types import ImageInput, Usage
 
 # Max image dimension before resizing (API limit ~20MB base64 ≈ ~5MB raw)
@@ -26,12 +27,16 @@ class OpenAIVLMBackend:
         model: str,
         name: str | None = None,
         max_tokens: int = 1024,
+        request_timeout: float = 60.0,
+        max_retries: int = 2,
     ) -> None:
         self.name = name or model
         self.model = model
         self.max_tokens = max_tokens
         self.last_usage: Usage = Usage()
-        self._client = OpenAI(api_key=api_key, base_url=base_url)
+        self._client = OpenAI(
+            api_key=api_key, base_url=base_url, timeout=request_timeout, max_retries=max_retries,
+        )
         self._image_cache: dict[str, tuple[str, str]] = {}  # path -> (base64, mime)
 
     def generate(self, image: ImageInput, query: str, **kwargs: object) -> str:
@@ -42,27 +47,32 @@ class OpenAIVLMBackend:
         if not isinstance(max_tokens, int):
             max_tokens = self.max_tokens
 
-        response = self._client.chat.completions.create(
-            model=self.model,
-            messages=[
-                {
-                    "role": "user",
-                    "content": [
-                        {
-                            "type": "image_url",
-                            "image_url": {
-                                "url": f"data:{mime};base64,{image_b64}",
+        try:
+            response = self._client.chat.completions.create(
+                model=self.model,
+                messages=[
+                    {
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "image_url",
+                                "image_url": {
+                                    "url": f"data:{mime};base64,{image_b64}",
+                                },
                             },
-                        },
-                        {
-                            "type": "text",
-                            "text": query,
-                        },
-                    ],
-                }
-            ],
-            max_tokens=max_tokens,
-        )
+                            {
+                                "type": "text",
+                                "text": query,
+                            },
+                        ],
+                    }
+                ],
+                max_tokens=max_tokens,
+            )
+        except APITimeoutError as exc:
+            raise BackendError(f"VLM request timed out: {exc}") from exc
+        except APIConnectionError as exc:
+            raise BackendError(f"VLM connection failed: {exc}") from exc
         usage = getattr(response, "usage", None)
         if usage is not None:
             self.last_usage = Usage(
