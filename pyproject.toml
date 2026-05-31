@@ -5,8 +5,9 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "edgent-core"
 version = "0.1.0"
-description = "Pre-release agent runtime kernel."
+description = "Minimal agent runtime kernel for intent routing, tool orchestration, and evaluation."
 readme = "README.md"
+license = {text = "MIT"}
 requires-python = ">=3.10"
 dependencies = [
   "jsonschema>=4.0.0",
