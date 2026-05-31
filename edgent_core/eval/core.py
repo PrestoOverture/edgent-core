@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import tempfile
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol
@@ -92,16 +93,31 @@ class EvalHarness:
                 entries.append(EvalEntry(**payload))
         return EvalDataset(schema_version="1.0", entries=entries)
 
-    def run(self, dataset: EvalDataset, orchestrator: Orchestrator) -> EvalRunResult:
-        """Run every case once and preserve trace references."""
+    def run(
+        self,
+        dataset: EvalDataset,
+        orchestrator: Orchestrator,
+        *,
+        max_workers: int = 1,
+    ) -> EvalRunResult:
+        """Run every case once and preserve trace references.
+
+        Args:
+            max_workers: Number of concurrent workers. 1 = serial (default).
+                         Each worker gets its own Orchestrator clone with a
+                         fresh trace logger, so no shared-state races.
+        """
 
         self._last_trace_records = []
+        max_workers = max(1, max_workers)
+
+        # Ensure we have a JsonlTraceLogger-backed orchestrator to clone
         local_temp_dir: tempfile.TemporaryDirectory[str] | None = None
-        run_orchestrator = orchestrator
+        template_orchestrator = orchestrator
         if not isinstance(orchestrator.trace_logger, JsonlTraceLogger):
             local_temp_dir = tempfile.TemporaryDirectory()
             logger = JsonlTraceLogger(Path(local_temp_dir.name))
-            run_orchestrator = Orchestrator(
+            template_orchestrator = Orchestrator(
                 router=orchestrator.router,
                 tool_registry=orchestrator.tool_registry,
                 confidence_hook=orchestrator.confidence_hook,
@@ -111,57 +127,128 @@ class EvalHarness:
             )
 
         try:
-            case_results: list[EvalCaseResult] = []
-            for entry in dataset.entries:
-                try:
-                    runtime_input = RuntimeInput(
-                        text=entry.text,
-                        image=ImageInput(path=entry.image_ref) if entry.image_ref else None,
-                        audio=AudioInput(path=entry.audio_ref) if entry.audio_ref else None,
-                        session_id=f"eval-{entry.case_id}",
-                    )
-                    output = run_orchestrator.run(runtime_input)
-                    trace_record = self._require_trace_record(run_orchestrator)
-                    self._last_trace_records.append(trace_record)
-
-                    schema_validation_passed: bool | None = None
-                    if entry.expected_request_intent is not None and self.payload_validator is not None:
-                        schema_validation_passed = self.payload_validator.validate(entry, output)
-
-                    matched_secondary = None
-                    if entry.expected_secondary_intent is not None:
-                        matched_secondary = (
-                            output.route_decision.secondary_intent == entry.expected_secondary_intent
-                        )
-
-                    case_results.append(
-                        EvalCaseResult(
-                            case_id=entry.case_id,
-                            trace_id=trace_record.trace_id,
-                            matched_gold_primary_intent=(
-                                output.route_decision.intent == entry.expected_primary_intent
-                            ),
-                            matched_gold_secondary_intent=matched_secondary,
-                            schema_validation_passed=schema_validation_passed,
-                        )
-                    )
-                except Exception as exc:
-                    # Log failure but continue with remaining cases
-                    import sys
-                    print(f"  WARN: case {entry.case_id} failed: {exc}", file=sys.stderr)
-                    case_results.append(
-                        EvalCaseResult(
-                            case_id=entry.case_id,
-                            trace_id="error",
-                            matched_gold_primary_intent=False,
-                            matched_gold_secondary_intent=None,
-                            schema_validation_passed=None,
-                        )
-                    )
+            if max_workers == 1:
+                case_results, trace_records = self._run_serial(dataset, template_orchestrator)
+            else:
+                case_results, trace_records = self._run_concurrent(dataset, template_orchestrator, max_workers)
+            self._last_trace_records = trace_records
             return EvalRunResult(case_results=case_results)
         finally:
             if local_temp_dir is not None:
                 local_temp_dir.cleanup()
+
+    def _clone_orchestrator(self, template: Orchestrator, trace_dir: Path) -> Orchestrator:
+        """Create an independent Orchestrator clone with a fresh trace logger."""
+        return Orchestrator(
+            router=template.router,
+            tool_registry=template.tool_registry,
+            confidence_hook=template.confidence_hook,
+            trace_logger=JsonlTraceLogger(trace_dir),
+            tool_arg_builder=template.tool_arg_builder,
+            backends=template.backends,
+        )
+
+    def _run_case(
+        self,
+        entry: EvalEntry,
+        orchestrator: Orchestrator,
+    ) -> tuple[EvalCaseResult, TraceRecord | None]:
+        """Run a single eval case. Returns (result, trace_record_or_none)."""
+        try:
+            runtime_input = RuntimeInput(
+                text=entry.text,
+                image=ImageInput(path=entry.image_ref) if entry.image_ref else None,
+                audio=AudioInput(path=entry.audio_ref) if entry.audio_ref else None,
+                session_id=f"eval-{entry.case_id}",
+            )
+            output = orchestrator.run(runtime_input)
+            trace_record = self._require_trace_record(orchestrator)
+
+            schema_validation_passed: bool | None = None
+            if entry.expected_request_intent is not None and self.payload_validator is not None:
+                schema_validation_passed = self.payload_validator.validate(entry, output)
+
+            matched_secondary = None
+            if entry.expected_secondary_intent is not None:
+                matched_secondary = (
+                    output.route_decision.secondary_intent == entry.expected_secondary_intent
+                )
+
+            result = EvalCaseResult(
+                case_id=entry.case_id,
+                trace_id=trace_record.trace_id,
+                matched_gold_primary_intent=(
+                    output.route_decision.intent == entry.expected_primary_intent
+                ),
+                matched_gold_secondary_intent=matched_secondary,
+                schema_validation_passed=schema_validation_passed,
+            )
+            return result, trace_record
+        except Exception as exc:
+            import sys
+            print(f"  WARN: case {entry.case_id} failed: {exc}", file=sys.stderr)
+            result = EvalCaseResult(
+                case_id=entry.case_id,
+                trace_id="error",
+                matched_gold_primary_intent=False,
+                matched_gold_secondary_intent=None,
+                schema_validation_passed=None,
+            )
+            return result, None
+
+    def _run_serial(
+        self,
+        dataset: EvalDataset,
+        orchestrator: Orchestrator,
+    ) -> tuple[list[EvalCaseResult], list[TraceRecord]]:
+        """Serial execution (max_workers=1)."""
+        case_results: list[EvalCaseResult] = []
+        trace_records: list[TraceRecord] = []
+        for entry in dataset.entries:
+            result, trace = self._run_case(entry, orchestrator)
+            case_results.append(result)
+            if trace is not None:
+                trace_records.append(trace)
+        return case_results, trace_records
+
+    def _run_concurrent(
+        self,
+        dataset: EvalDataset,
+        template: Orchestrator,
+        max_workers: int,
+    ) -> tuple[list[EvalCaseResult], list[TraceRecord]]:
+        """Concurrent execution with per-worker orchestrator clones."""
+        with tempfile.TemporaryDirectory() as pool_tmp:
+            # Pre-create one orchestrator clone per worker
+            orchestrators = [
+                self._clone_orchestrator(template, Path(pool_tmp) / f"worker-{i}")
+                for i in range(max_workers)
+            ]
+
+            case_results: list[EvalCaseResult] = []
+            trace_records: list[TraceRecord] = []
+
+            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                future_to_idx = {}
+                for idx, entry in enumerate(dataset.entries):
+                    worker_orch = orchestrators[idx % max_workers]
+                    future = executor.submit(self._run_case, entry, worker_orch)
+                    future_to_idx[future] = idx
+
+                # Collect results in submission order
+                ordered: list[tuple[EvalCaseResult, TraceRecord | None] | None] = [None] * len(dataset.entries)
+                for future in as_completed(future_to_idx):
+                    idx = future_to_idx[future]
+                    ordered[idx] = future.result()
+
+                for item in ordered:
+                    if item is not None:
+                        result, trace = item
+                        case_results.append(result)
+                        if trace is not None:
+                            trace_records.append(trace)
+
+            return case_results, trace_records
 
     def report(self, result: EvalRunResult) -> EvalSummary:
         """Compute the minimal Phase 1 summary from the last run."""

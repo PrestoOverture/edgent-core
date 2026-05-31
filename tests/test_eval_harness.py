@@ -143,3 +143,47 @@ def test_eval_harness_with_payload_validator(tmp_path) -> None:  # noqa: ANN001
     assert result.case_results[0].schema_validation_passed is None
     assert result.case_results[1].schema_validation_passed is True
     assert summary.schema_validation_pass_rate == 1.0
+
+
+def test_eval_harness_concurrent_matches_serial(tmp_path) -> None:  # noqa: ANN001
+    """Concurrent (max_workers=4) must produce identical case-level results as serial."""
+    dataset_path = tmp_path / "entries.jsonl"
+    _write_dataset(dataset_path)
+    harness_serial = EvalHarness()
+    harness_concurrent = EvalHarness()
+    dataset = harness_serial.load_dataset(str(dataset_path))
+
+    serial_result = harness_serial.run(dataset, _make_orchestrator(tmp_path), max_workers=1)
+    concurrent_result = harness_concurrent.run(dataset, _make_orchestrator(tmp_path), max_workers=4)
+
+    # Same number of results
+    assert len(concurrent_result.case_results) == len(serial_result.case_results)
+
+    # Same case IDs and match outcomes (order-independent)
+    serial_by_id = {c.case_id: c for c in serial_result.case_results}
+    concurrent_by_id = {c.case_id: c for c in concurrent_result.case_results}
+    assert set(serial_by_id.keys()) == set(concurrent_by_id.keys())
+    for case_id in serial_by_id:
+        s = serial_by_id[case_id]
+        c = concurrent_by_id[case_id]
+        assert s.matched_gold_primary_intent == c.matched_gold_primary_intent, f"Mismatch on {case_id}"
+        assert s.matched_gold_secondary_intent == c.matched_gold_secondary_intent
+        assert s.schema_validation_passed == c.schema_validation_passed
+
+
+def test_eval_harness_concurrent_summary_consistent(tmp_path) -> None:  # noqa: ANN001
+    """Summary metrics from concurrent run must match serial run."""
+    dataset_path = tmp_path / "entries.jsonl"
+    _write_dataset(dataset_path)
+    harness_serial = EvalHarness()
+    harness_concurrent = EvalHarness()
+    dataset = harness_serial.load_dataset(str(dataset_path))
+
+    serial_result = harness_serial.run(dataset, _make_orchestrator(tmp_path), max_workers=1)
+    concurrent_result = harness_concurrent.run(dataset, _make_orchestrator(tmp_path), max_workers=4)
+
+    serial_summary = harness_serial.report(serial_result)
+    concurrent_summary = harness_concurrent.report(concurrent_result)
+
+    assert abs(serial_summary.primary_intent_accuracy - concurrent_summary.primary_intent_accuracy) < 0.001
+    assert abs(serial_summary.schema_validation_pass_rate - concurrent_summary.schema_validation_pass_rate) < 0.001
